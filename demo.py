@@ -17,120 +17,62 @@ class LoraTrainingArguments:
     num_train_epochs: int
     lora_rank: int
     lora_alpha: int
-    lora_dropout: float
-    learning_rate: float = 5e-4  # H100可以使用更大的学习率
-    weight_decay: float = 0.01   # 添加权重衰减
-    warmup_ratio: float = 0.05   # 预热步数比例
+    lora_dropout: int
 
 
 def train_lora(
     model_id: str, context_length: int, training_args: LoraTrainingArguments
 ):
-    """使用 LoRA 微调模型，针对 H100 SXM 优化"""
     assert model_id in model2template, f"model_id {model_id} not supported"
-    
-    # 设置tokenizers并行化
-    os.environ["TOKENIZERS_PARALLELISM"] = "true"
-    
-    # 设置CUDA内存分配器配置
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
-    
-    # 检查 CUDA 是否可用
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available. Please check your PyTorch installation.")
-    
-    print(f"PyTorch version: {torch.__version__}")
-    print(f"CUDA version: {torch.version.cuda}")
-    print(f"GPU device: {torch.cuda.get_device_name(0)}")
-    
-    # 优化 LoRA 配置
     lora_config = LoraConfig(
-        r=training_args.lora_rank,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=training_args.lora_alpha,
-        lora_dropout=training_args.lora_dropout,
-        task_type="CAUSAL_LM",
-        modules_to_save=["embed_tokens", "lm_head"],
-        bias="none"
-    )
+    r=training_args.lora_rank,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # 修正模块名
+    lora_alpha=training_args.lora_alpha,
+    lora_dropout=training_args.lora_dropout,
+    task_type="CAUSAL_LM",
+    modules_to_save=["embed_tokens", "lm_head"]  # 新增关键层保留
+)
 
-    # H100显存充足，但仍需要合理使用
+    # Load model in 4-bit to do qLoRA
     bnb_config = BitsAndBytesConfig(
-        load_in_8bit=True,
-        llm_int8_threshold=6.0,
-        llm_int8_has_fp16_weight=True,
-        bnb_8bit_compute_dtype=torch.float16,
-        bnb_8bit_use_double_quant=False,
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
     )
-
-    # 设置环境变量优化性能
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
-    os.environ["CUDA_AUTO_TUNE"] = "1"
-    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
-    os.environ["MAX_JOBS"] = "24"
-
-    # 启用 TF32
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 
     training_args = SFTConfig(
-        per_device_train_batch_size=training_args.per_device_train_batch_size,  # 减小batch size以适应内存
-        gradient_accumulation_steps=training_args.gradient_accumulation_steps * 2,  # 增加梯度累积来补偿
+        per_device_train_batch_size=training_args.per_device_train_batch_size,
+        gradient_accumulation_steps=training_args.gradient_accumulation_steps,
+        warmup_steps=500,
+        learning_rate=2e-4,
+        bf16=True,
+        logging_steps=20,
+        output_dir="outputs",
+        optim="adamw_torch_fused",
+        remove_unused_columns=False,
         num_train_epochs=training_args.num_train_epochs,
         max_seq_length=context_length,
-        
-        # 优化器设置
-        learning_rate=training_args.learning_rate,
-        weight_decay=training_args.weight_decay,
-        warmup_ratio=training_args.warmup_ratio,
-        lr_scheduler_type="cosine",
-        optim="paged_adamw_8bit",  # 使用8-bit Adam优化器节省内存
-        
-        # 混合精度训练
-        bf16=True,
-        tf32=True,
-        
-        # 性能优化
-        gradient_checkpointing=True,  # 启用梯度检查点以节省内存
-        logging_steps=10,
-        save_strategy="epoch",
-        output_dir="outputs",
-        
-        # 数据加载优化
-        dataloader_num_workers=4,  # 减少worker数量以降低内存使用
-        group_by_length=True,
-        remove_unused_columns=False,
+        gradient_checkpointing=True,  # 传递梯度检查点配置
+        tf32=True,  # 启用TF32加速
+        lr_scheduler_type="cosine",  # 显式指定余弦衰减
+        warmup_ratio=0.1,  # 10%步数预热
+        max_grad_norm=1.0,  # 新增梯度裁剪
+#attn_implementation="flash_attention_2"  # 加速训练‌:ml-citation{ref="1,7" data="citationList"}
     )
-
     tokenizer = AutoTokenizer.from_pretrained(
         model_id,
         use_fast=True,
         trust_remote_code=True,
-        padding_side="right"  # 确保padding_side为right
+        padding_side="right"
     )
-
-    # 清理CUDA缓存
-    torch.cuda.empty_cache()
-    
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        device_map="auto",
-        trust_remote_code=True,
-        token=os.environ["HF_TOKEN"],
-        load_in_8bit=True,
         quantization_config=bnb_config,
-        torch_dtype=torch.float16,
+        device_map={"": 0},
+        token=os.environ["HF_TOKEN"],
     )
 
-    # 使用torch.compile加速
-    if torch.cuda.get_device_capability()[0] >= 8:
-        try:
-            model = torch.compile(model, mode="reduce-overhead")
-            print("Model successfully compiled")
-        except Exception as e:
-            print(f"Warning: Failed to compile model: {e}")
-
+    # Load dataset
     dataset = SFTDataset(
         file="data/demo_data.jsonl",
         tokenizer=tokenizer,
@@ -138,6 +80,7 @@ def train_lora(
         template=model2template[model_id],
     )
 
+    # Define trainer
     trainer = SFTTrainer(
         model=model,
         train_dataset=dataset,
@@ -146,31 +89,39 @@ def train_lora(
         data_collator=SFTDataCollator(tokenizer, max_seq_length=context_length),
     )
 
+    # Train model
     trainer.train()
+
+    # save model
     trainer.save_model("outputs")
+
+    # remove checkpoint folder
     os.system("rm -rf outputs/checkpoint-*")
+
+    # upload lora weights and tokenizer
     print("Training Completed.")
 
 
 if __name__ == "__main__":
+    # Define training arguments for LoRA fine-tuning
     training_args = LoraTrainingArguments(
         num_train_epochs=3,
-        per_device_train_batch_size=8,  # 减小batch size
-        gradient_accumulation_steps=4,   # 增加梯度累积步数
+        per_device_train_batch_size=8,
+        gradient_accumulation_steps=4,
         lora_rank=32,
-        lora_alpha=64,
+        lora_alpha=128,
         lora_dropout=0.05,
-        learning_rate=5e-4,
-        weight_decay=0.01,
-        warmup_ratio=0.05,
     )
 
+    # Set model ID and context length
     model_id = "microsoft/Phi-3.5-mini-instruct"
-    context_length = 2048
+    context_length = 4096
 
+    # Start LoRA fine-tuning
     train_lora(
-        model_id=model_id,
-        context_length=context_length,
-        training_args=training_args,
+        model_id=model_id, context_length=context_length, training_args=training_args
     )
+    torch.backends.cuda.matmul.allow_tf32 = True  # 启用TF32矩阵乘法
+    torch.backends.cudnn.allow_tf32 = True  # 启用TF32卷积
+
 
