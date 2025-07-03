@@ -14,7 +14,7 @@ model2template = {
 }
 
 model2size = {
-    "microsoft/Phi-3.5-mini-instruct": 3_000_000_000  # 假设 4B 参数
+    "microsoft/Phi-3.5-mini-instruct": 4_000_000_000  # 假设 4B 参数
 }
 
 model2base_model = {
