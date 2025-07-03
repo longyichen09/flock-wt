@@ -105,7 +105,7 @@ def train_lora(
 if __name__ == "__main__":
     # Define training arguments for LoRA fine-tuning
     training_args = LoraTrainingArguments(
-        num_train_epochs=3,
+        num_train_epochs=10,
         per_device_train_batch_size=8,
         gradient_accumulation_steps=8,
         lora_rank=64,
@@ -121,7 +121,4 @@ if __name__ == "__main__":
     train_lora(
         model_id=model_id, context_length=context_length, training_args=training_args
     )
-    torch.backends.cuda.matmul.allow_tf32 = True  # 启用TF32矩阵乘法
-    torch.backends.cudnn.allow_tf32 = True  # 启用TF32卷积
-
 
